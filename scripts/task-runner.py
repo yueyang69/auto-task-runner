@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-auto-task-runner v5.0 - Layer 1 调度层
+auto-task-runner v5.1 - Layer 1 调度层
 
 核心升级：
   - call_skill() 改用 StuckAwareRunner，解决 openclaw 流式卡住问题
   - 启动时拉起 Watchdog + Notifier 守护线程
   - tasks.json 新增 retry_count / stuck_reason / stuck_at / deferred 状态
   - resource_guard 升级为跨平台内存检测 + 任务前预检
+  - v5.1: 新增文件锁（竞态条件修复）+ 快照读取修复
 """
 
 import json
@@ -15,8 +16,10 @@ import sys
 import gc
 import time
 import subprocess
+import fcntl
 from datetime import datetime
 from pathlib import Path
+from contextlib import contextmanager
 
 # ===== 路径配置 =====
 SKILL_DIR        = Path(__file__).parent.parent
@@ -42,6 +45,36 @@ for _d in [CHECKPOINT_DIR, LOGS_DIR]:
     _d.mkdir(exist_ok=True, parents=True)
 
 sys.path.insert(0, str(Path(__file__).parent))
+
+
+# ===== 文件锁（竞态条件修复 #1）=====
+LOCK_FILE = RUNTIME_DIR / "tasks.lock"
+
+@contextmanager
+def tasks_lock(exclusive: bool = True):
+    """
+    tasks.json 文件锁，防止多进程并发读写导致数据损坏。
+    
+    Args:
+        exclusive: True=写锁（排他），False=读锁（共享）
+    
+    用法：
+        with tasks_lock(exclusive=True):
+            tasks = _load_tasks_unlocked()
+            tasks.append(new_task)
+            _save_tasks_unlocked(tasks)
+    """
+    LOCK_FILE.parent.mkdir(exist_ok=True, parents=True)
+    lock_fd = None
+    try:
+        lock_fd = open(LOCK_FILE, "w")
+        lock_type = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        fcntl.flock(lock_fd.fileno(), lock_type)
+        yield
+    finally:
+        if lock_fd:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+            lock_fd.close()
 
 
 # ===== 日志 =====
@@ -75,7 +108,10 @@ def _load_state() -> dict:
 
 
 # ===== tasks.json =====
-def _load_tasks() -> list:
+def _load_tasks_unlocked() -> list:
+    """
+    无锁版本：必须在 tasks_lock() 上下文内调用。
+    """
     if TASKS_FILE.exists():
         try:
             return json.loads(TASKS_FILE.read_text(encoding="utf-8")).get("tasks", [])
@@ -84,7 +120,10 @@ def _load_tasks() -> list:
     return []
 
 
-def _save_tasks(tasks: list):
+def _save_tasks_unlocked(tasks: list):
+    """
+    无锁版本：必须在 tasks_lock() 上下文内调用。
+    """
     RUNTIME_DIR.mkdir(exist_ok=True, parents=True)
     TASKS_FILE.write_text(
         json.dumps({"updated_at": datetime.now().isoformat(),
@@ -92,6 +131,22 @@ def _save_tasks(tasks: list):
                    ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
+
+
+def _load_tasks() -> list:
+    """
+    带锁版本：安全读取 tasks.json。
+    """
+    with tasks_lock(exclusive=False):
+        return _load_tasks_unlocked()
+
+
+def _save_tasks(tasks: list):
+    """
+    带锁版本：安全写入 tasks.json。
+    """
+    with tasks_lock(exclusive=True):
+        _save_tasks_unlocked(tasks)
 
 
 def _update_task(tasks: list, task_id: int, **kwargs) -> list:
